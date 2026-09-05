@@ -243,6 +243,35 @@ class PromptSRCModel(pl.LightningModule):
             p, a = F.normalize(p, dim=-1), F.normalize(a, dim=-1)
         return F.l1_loss(p, a)
 
+    def _infonce(self, sk_feat, ph_feat, cls_index):
+        """Symmetric InfoNCE between the prompted sketch and photo features.
+
+        In-batch negatives, temperature from --infonce_temperature.
+
+        --infonce_mode=instance is textbook InfoNCE: only (sketch_i, photo_i) is
+        positive. Careful -- the dataloader pairs each sketch with a RANDOM photo
+        of its own category, so two samples of the same class in one batch make
+        each other false negatives, and the loss then actively pushes apart
+        photos and sketches that should match at category level. With ~104 train
+        classes and a batch of 64 that happens in most batches.
+        --infonce_mode=class treats every same-category pair as positive
+        (multi-positive InfoNCE) and removes that conflict.
+        """
+        sk = F.normalize(sk_feat.float(), dim=-1)
+        ph = F.normalize(ph_feat.float(), dim=-1)
+        logits = sk @ ph.t() / float(self.opts.infonce_temperature)
+
+        if self.opts.infonce_mode == 'instance':
+            target = torch.arange(sk.shape[0], device=logits.device)
+            return 0.5 * (F.cross_entropy(logits, target)
+                          + F.cross_entropy(logits.t(), target))
+
+        pos = (cls_index[:, None] == cls_index[None, :]).float()
+        def _multi_pos(lg):
+            log_prob = F.log_softmax(lg, dim=-1)
+            return -((log_prob * pos).sum(dim=-1) / pos.sum(dim=-1).clamp(min=1)).mean()
+        return 0.5 * (_multi_pos(logits) + _multi_pos(logits.t()))
+
     def _logits(self, img_feat, txt_feat):
         img = F.normalize(img_feat.float(), dim=-1)
         txt = F.normalize(txt_feat.float(), dim=-1)
@@ -277,6 +306,7 @@ class PromptSRCModel(pl.LightningModule):
 
         losses = {}
         losses['L_retrieval'] = self.loss_fn(sketch_p, photo_p, neg_p)
+        losses['L_infonce'] = self._infonce(sketch_p, photo_p, cls_index)
         losses['L_SCL_image_photo'] = self._scl_feature_loss(photo_p, photo_a)
         losses['L_SCL_image_sketch'] = self._scl_feature_loss(sketch_p, sketch_a)
         losses['L_SCL_text'] = torch.stack([
@@ -297,7 +327,8 @@ class PromptSRCModel(pl.LightningModule):
             F.log_softmax(logits_a, dim=-1),
             reduction='batchmean', log_target=True)
 
-        losses['loss'] = (losses['L_retrieval']
+        losses['loss'] = (o.lambda_retrieval * losses['L_retrieval']
+                          + o.lambda_infonce * losses['L_infonce']
                           + o.lambda_scl_image * (losses['L_SCL_image_photo']
                                                   + losses['L_SCL_image_sketch'])
                           + o.lambda_scl_text * losses['L_SCL_text']
@@ -325,6 +356,7 @@ class PromptSRCModel(pl.LightningModule):
         self.log_dict({
             'loss': losses['loss'],
             'ret': losses['L_retrieval'],
+            'nce': losses['L_infonce'],
             'scl_i': losses['L_SCL_image_photo'] + losses['L_SCL_image_sketch'],
             'scl_t': losses['L_SCL_text'],
             'scl_lg': losses['L_SCL_logits'],

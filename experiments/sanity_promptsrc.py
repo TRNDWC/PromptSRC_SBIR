@@ -113,7 +113,7 @@ def main():
 
     # ------------------------------------------------------------- 3. losses
     print('\n== 3. individual losses ==')
-    for name in ['L_retrieval', 'L_SCL_image_photo', 'L_SCL_image_sketch',
+    for name in ['L_retrieval', 'L_infonce', 'L_SCL_image_photo', 'L_SCL_image_sketch',
                  'L_SCL_text', 'L_SCL_logits', 'loss']:
         v = losses[name].item()
         print('    %-20s = %.6f' % (name, v))
@@ -121,12 +121,41 @@ def main():
     for name in ['L_SCL_image_photo', 'L_SCL_image_sketch', 'L_SCL_text', 'L_SCL_logits']:
         check('%s >= 0' % name, losses[name].item() >= 0.0, '(%.6f)' % losses[name].item())
 
-    expected = (losses['L_retrieval']
+    check('L_infonce >= 0', losses['L_infonce'].item() >= 0.0,
+          '(%.6f, mode=%s)' % (losses['L_infonce'].item(), opts.infonce_mode))
+
+    expected = (opts.lambda_retrieval * losses['L_retrieval']
+                + opts.lambda_infonce * losses['L_infonce']
                 + opts.lambda_scl_image * (losses['L_SCL_image_photo'] + losses['L_SCL_image_sketch'])
                 + opts.lambda_scl_text * losses['L_SCL_text']
                 + opts.lambda_scl_logits * losses['L_SCL_logits'])
     check('L_final matches the formula', torch.allclose(expected, losses['loss']),
           '(%.6f vs %.6f)' % (expected.item(), losses['loss'].item()))
+
+    lambdas = [opts.lambda_retrieval, opts.lambda_infonce, opts.lambda_scl_image,
+               opts.lambda_scl_text, opts.lambda_scl_logits]
+    check('all loss weights are equal', len(set(lambdas)) == 1, str(lambdas))
+
+    # InfoNCE sanity: identical sketch/photo features must give the floor value
+    print('\n== 3b. InfoNCE ==')
+    with torch.no_grad():
+        f = torch.randn(4, 512)
+        cls_same = torch.tensor([0, 0, 1, 1])
+        perfect = model._infonce(f, f.clone(), cls_same).item()
+        random_pair = model._infonce(f, torch.randn(4, 512), cls_same).item()
+    print('    identical sketch/photo feats: %.6f | unrelated feats: %.6f'
+          % (perfect, random_pair))
+    check('InfoNCE is lower for a perfect match', perfect < random_pair)
+    orig_mode = opts.infonce_mode
+    try:
+        for mode in ['instance', 'class']:
+            opts.infonce_mode = mode
+            with torch.no_grad():
+                v = model._infonce(f, f.clone(), cls_same).item()
+            print('    mode=%-8s aligned-feature loss = %.6f' % (mode, v))
+            check('mode=%s is finite and >= 0' % mode, v >= 0 and v == v)
+    finally:
+        opts.infonce_mode = orig_mode
 
     # ------------------------------------------------------------ 4. backward
     print('\n== 4. backward ==')

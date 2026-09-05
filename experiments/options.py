@@ -68,10 +68,25 @@ parser.add_argument('--n_text_templates', type=int, default=3,
 parser.add_argument('--text_scl_domains', type=str, default='photo,sketch',
                     help='domains averaged in L_SCL_text')
 
-# loss weights -- giá trị tạm từ PromptSRC, chưa tune cho SBIR
-parser.add_argument('--lambda_scl_image', type=float, default=10.0)   # lambda1
-parser.add_argument('--lambda_scl_text', type=float, default=25.0)    # lambda2
+# loss weights.
+# Đã đổi sang 1.0 cho MỌI thành phần theo yêu cầu (các thành phần cân bằng nhau).
+# Giá trị cũ lambda1=10 / lambda2=25 là của PromptSRC gốc, dùng cho loss chính là
+# CE classification (thang đo vài đơn vị); ở đây loss chính là triplet cosine
+# (thang đo ~0.2) nên tỉ lệ đó làm SCL át hẳn retrieval. Cả hai bộ đều CHƯA tune
+# cho SBIR -- đây vẫn là baseline để chạy, không phải giá trị để kết luận.
+parser.add_argument('--lambda_scl_image', type=float, default=1.0)   # lambda1
+parser.add_argument('--lambda_scl_text', type=float, default=1.0)    # lambda2
 parser.add_argument('--lambda_scl_logits', type=float, default=1.0)
+parser.add_argument('--lambda_retrieval', type=float, default=1.0)
+
+# InfoNCE giữa prompted sketch feature và prompted photo feature
+parser.add_argument('--lambda_infonce', type=float, default=1.0)
+parser.add_argument('--infonce_temperature', type=float, default=0.07)
+parser.add_argument('--infonce_mode', type=str, default='instance',
+                    choices=['instance', 'class'],
+                    help='instance: chỉ cặp (sketch_i, photo_i) là positive (InfoNCE chuẩn). '
+                         'class: mọi cặp cùng category là positive -- tránh false negative '
+                         'khi batch có nhiều mẫu trùng lớp, hợp với category-level ZS-SBIR.')
 parser.add_argument('--scl_normalize_features', type=int, default=1,
                     help='L2-normalise both sides of the SCL feature L1 losses')
 parser.add_argument('--scl_logits_anchor', type=str, default='sketch',
