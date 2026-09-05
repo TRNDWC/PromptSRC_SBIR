@@ -20,7 +20,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 
 from src.model_promptsrc import PromptSRCModel
-from src.dataset_retrieval import Sketchy, ValidDataset
+from src.dataset_retrieval import Sketchy
 from experiments.options import opts
 
 if __name__ == '__main__':
@@ -29,12 +29,12 @@ if __name__ == '__main__':
     train_loader = DataLoader(dataset=train_dataset, batch_size=opts.batch_size,
                               num_workers=opts.workers, shuffle=True, drop_last=True)
 
-    val_sketch_loader = DataLoader(dataset=ValidDataset(opts, mode='sketch'),
-                                   batch_size=opts.test_batch_size,
-                                   num_workers=opts.workers, shuffle=False)
-    val_photo_loader = DataLoader(dataset=ValidDataset(opts, mode='photo'),
-                                  batch_size=opts.test_batch_size,
-                                  num_workers=opts.workers, shuffle=False)
+    # ZS-SBIR evaluation exactly as in the original repo: the unseen-class
+    # triplet set, sketches as queries and their paired photos as the gallery.
+    val_dataset = Sketchy(opts, dataset_transforms, mode='val',
+                          used_cat=train_dataset.all_categories, return_orig=False)
+    val_loader = DataLoader(dataset=val_dataset, batch_size=opts.test_batch_size,
+                            num_workers=opts.workers, shuffle=False)
 
     logger = TensorBoardLogger('tb_logs', name=opts.exp_name)
     checkpoint_callback = ModelCheckpoint(
@@ -70,5 +70,5 @@ if __name__ == '__main__':
     model = PromptSRCModel()
     trainer.fit(model,
                 train_dataloaders=train_loader,
-                val_dataloaders=[val_sketch_loader, val_photo_loader],
+                val_dataloaders=val_loader,
                 ckpt_path=ckpt_path)

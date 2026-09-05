@@ -113,8 +113,7 @@ class PromptSRCModel(pl.LightningModule):
         self._anchor_text_cache = {}
 
         self.best_metric = -1e3
-        self.val_step_outputs_sk = []
-        self.val_step_outputs_ph = []
+        self.val_step_outputs = []
 
     def train(self, mode=True):
         # the backbone stays in eval mode whatever Lightning does to the module
@@ -370,51 +369,64 @@ class PromptSRCModel(pl.LightningModule):
             if agg is not None:
                 agg.update(module, self.current_epoch)
 
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        image_tensor, label = batch
-        domain = 'sketch' if dataloader_idx == 0 else 'photo'
+    def validation_step(self, batch, batch_idx):
+        """Same protocol as the original repo (aneeshan95/Sketch_LVM): the val
+        set is Sketchy(mode='val') over the unseen classes, the query set is the
+        sketch features and the gallery is the paired photo features."""
+        sk_tensor, img_tensor, neg_tensor, category = batch[:4]
         # inference uses the GPA prompts, not the last-epoch prompts
         with use_aggregated_prompts(self._gpa_pairs()), torch.no_grad():
-            feat, _ = self.encode_image_branch(image_tensor, domain, return_anchor=False)
-        if dataloader_idx == 0:
-            self.val_step_outputs_sk.append((feat.float(), label))
-        else:
-            self.val_step_outputs_ph.append((feat.float(), label))
+            sk_feat, _ = self.encode_image_branch(sk_tensor, 'sketch', return_anchor=False)
+            img_feat, _ = self.encode_image_branch(img_tensor, 'photo', return_anchor=False)
+            neg_feat, _ = self.encode_image_branch(neg_tensor, 'photo', return_anchor=False)
+        self.log('val_loss', self.loss_fn(sk_feat, img_feat, neg_feat))
+        self.val_step_outputs.append((sk_feat.float(), img_feat.float(), list(category)))
 
     def on_validation_epoch_end(self):
-        if not self.val_step_outputs_sk or not self.val_step_outputs_ph:
-            self.val_step_outputs_sk.clear()
-            self.val_step_outputs_ph.clear()
+        if not self.val_step_outputs:
             return
 
-        query = torch.cat([f for f, _ in self.val_step_outputs_sk])
-        gallery = torch.cat([f for f, _ in self.val_step_outputs_ph])
-        sk_cat = np.concatenate([l.cpu().numpy() for _, l in self.val_step_outputs_sk])
-        ph_cat = np.concatenate([l.cpu().numpy() for _, l in self.val_step_outputs_ph])
+        query = torch.cat([q for q, _, _ in self.val_step_outputs])
+        gallery = torch.cat([g for _, g, _ in self.val_step_outputs])
+        all_category = np.array(sum([c for _, _, c in self.val_step_outputs], []))
 
-        # per-dataset protocol, overridable with --map_k / --p_k (0 = @all)
+        # Original metric: mAP over the whole ranking, no cutoff. mAP@k and P@k
+        # follow the per-dataset protocol in dataset_retrieval.DATASET_METRICS
+        # (Sketchy 200/200, TU-Berlin all/100, QuickDraw all/200).
         map_k, p_k = get_metric_config(self.opts)
-        ap = torch.zeros(len(query))
+        ap_all = torch.zeros(len(query))
+        ap_k = torch.zeros(len(query))
         precision = torch.zeros(len(query))
         for idx, sk_feat in enumerate(query):
-            sim = F.cosine_similarity(sk_feat.unsqueeze(0), gallery).cpu()
+            # The original ranks by -1 * (1 - cos), i.e. cos - 1, which is <= 0
+            # everywhere. That is correct on torchmetrics 0.9.3 (pinned in
+            # environment.yml), which only argsorts. Newer torchmetrics added
+            # `target = torch.where(preds > 0, target, 0)` to
+            # retrieval_average_precision/precision/recall/reciprocal_rank, so
+            # every non-positive score is forced to "irrelevant" and the metric
+            # collapses to exactly 0.0. Rank by (1 + cos) / 2 instead: same
+            # ordering, strictly positive, correct on both versions.
+            cos = 1.0 - self.distance_fn(sk_feat.unsqueeze(0), gallery)
+            score = ((1.0 + cos) / 2.0).clamp(min=1e-6).cpu()
             target = torch.zeros(len(gallery), dtype=torch.bool)
-            # GZS distractors carry label -1, so they never match a query
-            target[np.where(ph_cat == sk_cat[idx])] = True
-            ap[idx] = retrieval_average_precision(
-                sim, target, top_k=min(map_k, len(gallery)) if map_k > 0 else None)
+            target[np.where(all_category == all_category[idx])] = True
+            ap_all[idx] = retrieval_average_precision(score, target)
+            ap_k[idx] = retrieval_average_precision(
+                score, target, top_k=min(map_k, len(gallery))) if map_k > 0 else ap_all[idx]
             precision[idx] = retrieval_precision(
-                sim, target, top_k=min(p_k, len(gallery)) if p_k > 0 else None)
+                score, target, top_k=min(p_k, len(gallery)) if p_k > 0 else None)
 
-        mAP = torch.mean(ap)
+        mAP = torch.mean(ap_all)
         self.log('mAP', mAP, on_step=False, on_epoch=True)
+        self.log('mAP_k', torch.mean(ap_k), on_step=False, on_epoch=True)
         self.log('prec', torch.mean(precision), on_step=False, on_epoch=True)
         self.best_metric = max(self.best_metric, mAP.item())
-        print('[%s] mAP@%s: %.4f, P@%s: %.4f, best mAP: %.4f  (|query|=%d, |gallery|=%d)'
-              % (self.opts.dataset,
-                 map_k if map_k > 0 else 'all', mAP.item(),
-                 p_k if p_k > 0 else 'all', torch.mean(precision).item(),
-                 self.best_metric, len(query), len(gallery)))
+        parts = ['mAP@all: %.4f' % mAP.item()]
+        if map_k > 0:  # otherwise the dataset protocol is mAP@all, already shown
+            parts.append('mAP@%d: %.4f' % (map_k, torch.mean(ap_k).item()))
+        parts.append('P@%s: %.4f' % (p_k if p_k > 0 else 'all', torch.mean(precision).item()))
+        print('[%s] %s | best mAP@all: %.4f  (|query|=%d, |gallery|=%d)'
+              % (self.opts.dataset, ' | '.join(parts), self.best_metric,
+                 len(query), len(gallery)))
 
-        self.val_step_outputs_sk.clear()
-        self.val_step_outputs_ph.clear()
+        self.val_step_outputs.clear()

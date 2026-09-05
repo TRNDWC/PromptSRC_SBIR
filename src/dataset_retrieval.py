@@ -71,15 +71,9 @@ def get_unseen_classes(opts):
 
 
 def get_metric_config(opts):
-    """(map_k, p_k) for the dataset, unless overridden on the command line.
-
-    0 means @all. --map_k / --p_k default to -1 = "use the dataset protocol".
-    """
+    """(map_k, p_k) for the configured dataset. 0 means @all."""
     default = DATASET_METRICS[getattr(opts, 'dataset', 'sketchy_ext')]
-    map_k = int(getattr(opts, 'map_k', -1))
-    p_k = int(getattr(opts, 'p_k', -1))
-    return (default['map_k'] if map_k < 0 else map_k,
-            default['p_k'] if p_k < 0 else p_k)
+    return default['map_k'], default['p_k']
 
 visualize_classes = [
     "cow",
@@ -169,12 +163,11 @@ def normal_transform():
     return dataset_transforms
 
 class ValidDataset(torch.utils.data.Dataset):
-    """ZS-SBIR evaluation set: unseen-class sketches (query) or photos (gallery).
+    """Flat set of unseen-class sketches or photos, one label per sample.
 
-    Generalized ZS-SBIR (--gzs=1): a --gzs_perc fraction of the SEEN-class
-    photos is added to the gallery as distractors, labelled -1 so they are never
-    relevant to any query. Queries stay unseen-class sketches. Sampling is
-    seeded, so the gallery is identical across epochs and runs.
+    Not used by the ZS-SBIR evaluation, which follows the original repo and
+    runs on Sketchy(mode='val') triplets. This backs the t-SNE plot in
+    experiments/LN_prompt.py.
     """
 
     def __init__(self, args, mode='photo', categories=None):
@@ -185,8 +178,6 @@ class ValidDataset(torch.utils.data.Dataset):
         self.args = args
         self.mode = mode
         self.transform = normal_transform()
-        self.gzs_perc = float(getattr(args, 'gzs_perc', 0.2))
-        self.seed = 42
 
         self.global_categories = os.listdir(os.path.join(self.args.data_dir, 'sketch'))
         if '.ipynb_checkpoints' in self.global_categories:
@@ -206,24 +197,6 @@ class ValidDataset(torch.utils.data.Dataset):
             paths = glob.glob(os.path.join(self.args.data_dir, subdir, category, '*'))
             self.paths.extend(paths)
             self.labels.extend([self.categories.index(category)] * len(paths))
-
-        # generalized ZS-SBIR: seen-class photos as gallery distractors
-        if self.mode == 'photo' and int(getattr(args, 'gzs', 0)) and self.gzs_perc > 0:
-            seen = sorted(set(self.global_categories) - set(self.categories))
-            rng = np.random.RandomState(self.seed)
-            for category in seen:
-                paths = sorted(glob.glob(os.path.join(self.args.data_dir, 'photo', category, '*')))
-                if not paths:
-                    continue
-                n = int(round(len(paths) * self.gzs_perc))
-                if n <= 0:
-                    continue
-                chosen = rng.choice(len(paths), size=n, replace=False)
-                self.paths.extend([paths[i] for i in chosen])
-                self.labels.extend([-1] * n)  # never relevant to an unseen query
-            print('[ValidDataset] GZS gallery: %d unseen + %d seen distractors'
-                  % (sum(1 for l in self.labels if l >= 0),
-                     sum(1 for l in self.labels if l < 0)))
 
     def __getitem__(self, index):
         filepath = self.paths[index]
