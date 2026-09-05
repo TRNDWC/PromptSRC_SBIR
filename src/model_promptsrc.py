@@ -416,17 +416,24 @@ class PromptSRCModel(pl.LightningModule):
             precision[idx] = retrieval_precision(
                 score, target, top_k=min(p_k, len(gallery)) if p_k > 0 else None)
 
-        mAP = torch.mean(ap_all)
+        # 'mAP' is the protocol metric of --dataset (mAP@200 for Sketchy,
+        # mAP@all for TU-Berlin / QuickDraw). ModelCheckpoint and best_metric
+        # track it, so the selected checkpoint is the best under the protocol
+        # actually being reported. mAP@all is logged too when they differ.
+        mAP = torch.mean(ap_k) if map_k > 0 else torch.mean(ap_all)
         self.log('mAP', mAP, on_step=False, on_epoch=True)
-        self.log('mAP_k', torch.mean(ap_k), on_step=False, on_epoch=True)
+        self.log('mAP_all', torch.mean(ap_all), on_step=False, on_epoch=True)
         self.log('prec', torch.mean(precision), on_step=False, on_epoch=True)
         self.best_metric = max(self.best_metric, mAP.item())
-        parts = ['mAP@all: %.4f' % mAP.item()]
-        if map_k > 0:  # otherwise the dataset protocol is mAP@all, already shown
-            parts.append('mAP@%d: %.4f' % (map_k, torch.mean(ap_k).item()))
-        parts.append('P@%s: %.4f' % (p_k if p_k > 0 else 'all', torch.mean(precision).item()))
-        print('[%s] %s | best mAP@all: %.4f  (|query|=%d, |gallery|=%d)'
-              % (self.opts.dataset, ' | '.join(parts), self.best_metric,
+
+        map_name = 'mAP@%d' % map_k if map_k > 0 else 'mAP@all'
+        p_name = 'P@%d' % p_k if p_k > 0 else 'P@all'
+        parts = ['%s: %.4f' % (map_name, mAP.item()),
+                 '%s: %.4f' % (p_name, torch.mean(precision).item())]
+        if map_k > 0:  # secondary, not the protocol number
+            parts.append('(mAP@all: %.4f)' % torch.mean(ap_all).item())
+        print('[%s] %s | best %s: %.4f  (|query|=%d, |gallery|=%d)'
+              % (self.opts.dataset, ' | '.join(parts), map_name, self.best_metric,
                  len(query), len(gallery)))
 
         self.val_step_outputs.clear()
