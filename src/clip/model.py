@@ -199,8 +199,39 @@ class Transformer(nn.Module):
         self.layers = layers
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor):
-        return self.resblocks(x)
+    def forward(self, x: torch.Tensor, deep_prompts=None, prompt_slice=None):
+        """x: [L, N, D] (LND).
+
+        deep_prompts: optional sequence of tensors, one per transformer block
+            starting at block 1 (block 0 receives its prompt at the input of the
+            encoder, exactly like the original shallow-prompt path). Each entry is
+            [V, D] (shared across the batch) or [N, V, D] (per-sample).
+        prompt_slice: (start, end) positions along L that hold the prompt tokens
+            and get overwritten before each block. Required when deep_prompts is
+            given.
+
+        With deep_prompts=None the call is byte-for-byte the original
+        ``self.resblocks(x)``, so every existing prompt-free code path is
+        unaffected.
+        """
+        if deep_prompts is None:
+            return self.resblocks(x)
+
+        assert prompt_slice is not None, 'prompt_slice is required with deep_prompts'
+        start, end = prompt_slice
+        n_deep = len(deep_prompts)
+        for i, blk in enumerate(self.resblocks):
+            if 0 < i <= n_deep:
+                p = deep_prompts[i - 1].to(dtype=x.dtype, device=x.device)
+                if p.dim() == 2:  # [V, D] -> [V, N, D]
+                    p = p.unsqueeze(1).expand(-1, x.shape[1], -1)
+                else:  # [N, V, D] -> [V, N, D]
+                    p = p.permute(1, 0, 2)
+                assert p.shape[0] == end - start, \
+                    'deep prompt length %d does not match prompt_slice %s' % (p.shape[0], (start, end))
+                x = torch.cat([x[:start], p, x[end:]], dim=0)
+            x = blk(x)
+        return x
 
 
 class VisionTransformer(nn.Module):
@@ -220,7 +251,7 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, prompt: torch.Tensor = None):
+    def forward(self, x: torch.Tensor, prompt: torch.Tensor = None, deep_prompts=None):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -232,7 +263,14 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        if deep_prompts is not None:
+            assert prompt is not None, 'deep visual prompts require the layer-0 prompt'
+            n_prompt = prompt.shape[1]
+            seq_len = x.shape[0]
+            # prompts sit at the tail of the sequence (see the cat above)
+            x = self.transformer(x, deep_prompts, (seq_len - n_prompt, seq_len))
+        else:
+            x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
@@ -340,18 +378,37 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, prompt=None):
+    def encode_image(self, image, prompt=None, deep_prompts=None):
         if prompt is not None:
-            return self.visual(image.type(self.dtype), prompt.type(self.dtype))
+            return self.visual(image.type(self.dtype), prompt.type(self.dtype), deep_prompts)
         else:
             return self.visual(image.type(self.dtype))
 
-    def encode_text(self, text):
+    def encode_text(self, text, ctx=None, deep_prompts=None):
+        """ctx: optional [n_ctx, D] or [batch, n_ctx, D] learnable context that
+        replaces the token embeddings at positions 1..n_ctx (right after SOS),
+        the CoOp/PromptSRC convention. deep_prompts overwrite those same
+        positions at the input of blocks 1..len(deep_prompts).
+
+        ctx=None and deep_prompts=None reproduce the original behaviour exactly.
+        """
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+
+        n_ctx = 0
+        if ctx is not None:
+            ctx = ctx.type(self.dtype)
+            if ctx.dim() == 2:
+                ctx = ctx.unsqueeze(0).expand(x.shape[0], -1, -1)
+            n_ctx = ctx.shape[1]
+            x = torch.cat([x[:, :1], ctx, x[:, 1 + n_ctx:]], dim=1)
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        if deep_prompts is not None:
+            assert n_ctx > 0, 'deep text prompts require ctx'
+            x = self.transformer(x, deep_prompts, (1, 1 + n_ctx))
+        else:
+            x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
