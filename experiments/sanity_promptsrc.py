@@ -98,8 +98,12 @@ def main():
         print('    %-18s %s  requires_grad=%s' % ('text_prompted[%s]' % domain, tuple(t.shape), t.requires_grad))
     for domain, t in feats['text_anchor'].items():
         print('    %-18s %s  requires_grad=%s' % ('text_anchor[%s]' % domain, tuple(t.shape), t.requires_grad))
-    print('    %-18s %s' % ('logits_prompted', tuple(feats['logits_prompted'].shape)))
-    print('    %-18s %s' % ('logits_anchor', tuple(feats['logits_anchor'].shape)))
+    print('    SCL-logits branches: %s' % feats['scl_logits_branches'])
+    for b in feats['scl_logits_branches']:
+        print('    %-18s %s  (image=%s, text=P_t[%s])'
+              % ('logits[%s]' % b, tuple(feats['logits_prompted'][b].shape), b, b))
+        check('logits_anchor[%s].requires_grad is False' % b,
+              feats['logits_anchor'][b].requires_grad is False)
 
     check('prompted image feats have grad',
           feats['photo_prompted'].requires_grad and feats['sketch_prompted'].requires_grad)
@@ -112,16 +116,25 @@ def main():
         check('%s.requires_grad is False' % key, feats[key].requires_grad is False)
     for domain, t in feats['text_anchor'].items():
         check('text_anchor[%s].requires_grad is False' % domain, t.requires_grad is False)
-    check('logits_anchor.requires_grad is False', feats['logits_anchor'].requires_grad is False)
 
     # ------------------------------------------------------------- 3. losses
     print('\n== 3. individual losses ==')
-    for name in ['L_retrieval', 'L_infonce', 'L_SCL_image_photo', 'L_SCL_image_sketch',
-                 'L_SCL_text', 'L_SCL_logits', 'loss']:
+    for name in ['L_retrieval', 'L_infonce', 'L_ce_photo', 'L_ce_sketch', 'L_ce',
+                 'L_SCL_image_photo', 'L_SCL_image_sketch',
+                 'L_SCL_text', 'L_SCL_logits_photo', 'L_SCL_logits_sketch',
+                 'L_SCL_logits', 'loss']:
         v = losses[name].item()
         print('    %-20s = %.6f' % (name, v))
         check('%s is finite' % name, torch.isfinite(losses[name]).item(), '')
-    for name in ['L_SCL_image_photo', 'L_SCL_image_sketch', 'L_SCL_text', 'L_SCL_logits']:
+    check('L_ce == sum của hai domain',
+          abs(losses['L_ce'].item() - losses['L_ce_photo'].item()
+              - losses['L_ce_sketch'].item()) < 1e-6)
+    check('L_SCL_logits == sum của hai nhánh',
+          abs(losses['L_SCL_logits'].item()
+              - losses['L_SCL_logits_photo'].item()
+              - losses['L_SCL_logits_sketch'].item()) < 1e-6)
+    for name in ['L_SCL_image_photo', 'L_SCL_image_sketch', 'L_SCL_text',
+                 'L_SCL_logits_photo', 'L_SCL_logits_sketch', 'L_SCL_logits']:
         check('%s >= 0' % name, losses[name].item() >= 0.0, '(%.6f)' % losses[name].item())
 
     check('L_infonce >= 0', losses['L_infonce'].item() >= 0.0,
@@ -129,6 +142,7 @@ def main():
 
     expected = (opts.lambda_retrieval * losses['L_retrieval']
                 + opts.lambda_infonce * losses['L_infonce']
+                + opts.lambda_ce * losses['L_ce']
                 + opts.lambda_scl_image * (losses['L_SCL_image_photo'] + losses['L_SCL_image_sketch'])
                 + opts.lambda_scl_text * losses['L_SCL_text']
                 + opts.lambda_scl_logits * losses['L_SCL_logits'])
@@ -138,6 +152,7 @@ def main():
     print('    weights: retrieval=%.1f infonce=%.1f scl_image=%.1f scl_text=%.1f scl_logits=%.1f'
           % (opts.lambda_retrieval, opts.lambda_infonce, opts.lambda_scl_image,
              opts.lambda_scl_text, opts.lambda_scl_logits))
+    print('    lambda_ce=%.1f' % opts.lambda_ce)
     if opts.lambda_retrieval == 0:
         check('triplet is out of the objective', losses['L_retrieval'].item() == 0.0)
         check('negative is not encoded when the triplet is off',
@@ -147,6 +162,7 @@ def main():
     contrib = {
         'retrieval': opts.lambda_retrieval * losses['L_retrieval'].item(),
         'infonce': opts.lambda_infonce * losses['L_infonce'].item(),
+        'ce': opts.lambda_ce * losses['L_ce'].item(),
         'scl_image': opts.lambda_scl_image * (losses['L_SCL_image_photo'].item()
                                               + losses['L_SCL_image_sketch'].item()),
         'scl_text': opts.lambda_scl_text * losses['L_SCL_text'].item(),

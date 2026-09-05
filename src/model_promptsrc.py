@@ -285,7 +285,12 @@ class PromptSRCModel(pl.LightningModule):
         # class vocabulary of this batch, used for the SCL-logits term
         class_list = sorted(set(categories))
         cls_index = torch.tensor([class_list.index(c) for c in categories], device=self.device)
-        domains = sorted(set(self.text_scl_domains + [o.scl_logits_anchor]))
+        branches = (['photo', 'sketch'] if o.scl_logits_anchor == 'both'
+                    else [o.scl_logits_anchor])
+        # L_ce needs the text prompt of BOTH domains regardless of what
+        # --scl_logits_anchor / --text_scl_domains ask for, so both are always
+        # encoded; otherwise a narrower config raises KeyError on text_p.
+        domains = sorted(set(self.text_scl_domains + branches + ['photo', 'sketch']))
 
         # ---- every frozen anchor FIRST, in one original-LayerNorm block ------
         # Ordering matters: original_ln() restores the pristine LN weights in
@@ -319,22 +324,45 @@ class PromptSRCModel(pl.LightningModule):
             self._scl_feature_loss(text_p[d], text_a[d]) for d in self.text_scl_domains
         ]).mean()
 
-        # DESIGN HYPOTHESIS: which image branch pairs with the text logits is a
-        # choice, not something the paper settles for retrieval -- hence the
-        # --scl_logits_anchor flag (sketch by default) instead of a hardcoded one.
-        anchor_domain = o.scl_logits_anchor
-        img_p = sketch_p if anchor_domain == 'sketch' else photo_p
-        img_a = sketch_a if anchor_domain == 'sketch' else photo_a
-        logits_p = self._logits(img_p, text_p[anchor_domain])
-        logits_a = self._logits(img_a, text_a[anchor_domain])
-        # frozen pair is the teacher: KL(frozen || prompted)
-        losses['L_SCL_logits'] = F.kl_div(
-            F.log_softmax(logits_p, dim=-1),
-            F.log_softmax(logits_a, dim=-1),
-            reduction='batchmean', log_target=True)
+        # SCL-logits, one term per image branch, each matched with the text
+        # prompt of its OWN domain (sketch image vs P_t[sketch], photo image vs
+        # P_t[photo]). This is the only path by which the text prompts reach the
+        # visual ones, so running it on both branches is what keeps P_t[photo]
+        # and P_v_photo connected at all; with a single branch the other
+        # domain's text prompt trains against nothing that inference ever uses.
+        # The two terms are summed, like L_SCL_image.
+        img_p_by = {'photo': photo_p, 'sketch': sketch_p}
+        img_a_by = {'photo': photo_a, 'sketch': sketch_a}
+        zero = torch.zeros((), device=photo_p.device)
+
+        # prompted image-vs-own-domain-text logits, computed for both domains:
+        # the CE below uses both, the SCL-KL uses the --scl_logits_anchor subset
+        logits_p = {d: self._logits(img_p_by[d], text_p[d]) for d in ('photo', 'sketch')}
+
+        # Cross-entropy image<->text per domain, summed. Targets are the class
+        # of each sample within the batch vocabulary. This is PromptSRC's main
+        # objective, restored in two-branch form, and it is the one term that
+        # gives the text prompts a direct say in the image features.
+        losses['L_ce_photo'] = F.cross_entropy(logits_p['photo'], cls_index)
+        losses['L_ce_sketch'] = F.cross_entropy(logits_p['sketch'], cls_index)
+        losses['L_ce'] = losses['L_ce_photo'] + losses['L_ce_sketch']
+
+        logits_a = {}
+        losses['L_SCL_logits_photo'] = zero
+        losses['L_SCL_logits_sketch'] = zero
+        for b in branches:
+            logits_a[b] = self._logits(img_a_by[b], text_a[b])
+            # frozen pair is the teacher: KL(frozen || prompted)
+            losses['L_SCL_logits_%s' % b] = F.kl_div(
+                F.log_softmax(logits_p[b], dim=-1),
+                F.log_softmax(logits_a[b], dim=-1),
+                reduction='batchmean', log_target=True)
+        losses['L_SCL_logits'] = (losses['L_SCL_logits_photo']
+                                  + losses['L_SCL_logits_sketch'])
 
         losses['loss'] = (o.lambda_retrieval * losses['L_retrieval']
                           + o.lambda_infonce * losses['L_infonce']
+                          + o.lambda_ce * losses['L_ce']
                           + o.lambda_scl_image * (losses['L_SCL_image_photo']
                                                   + losses['L_SCL_image_sketch'])
                           + o.lambda_scl_text * losses['L_SCL_text']
@@ -345,7 +373,7 @@ class PromptSRCModel(pl.LightningModule):
                  'neg_prompted': neg_p,
                  'text_prompted': text_p, 'text_anchor': text_a,
                  'logits_prompted': logits_p, 'logits_anchor': logits_a,
-                 'cls_index': cls_index}
+                 'cls_index': cls_index, 'scl_logits_branches': branches}
         return losses, feats
 
     # ------------------------------------------------------------------- steps
@@ -364,6 +392,7 @@ class PromptSRCModel(pl.LightningModule):
             'loss': losses['loss'],
             'ret': losses['L_retrieval'],
             'nce': losses['L_infonce'],
+            'ce': losses['L_ce'],
             'scl_i': losses['L_SCL_image_photo'] + losses['L_SCL_image_sketch'],
             'scl_t': losses['L_SCL_text'],
             'scl_lg': losses['L_SCL_logits'],

@@ -60,9 +60,9 @@ parser.add_argument('--n_prompts_text', type=int, default=4)
 parser.add_argument('--prompt_init_std', type=float, default=0.02)
 
 # text branch
-parser.add_argument('--text_prompt_mode', type=str, default='shared',
+parser.add_argument('--text_prompt_mode', type=str, default='per_domain',
                     choices=['shared', 'per_domain'],
-                    help='one shared P_t, or separate P_t per domain')
+                    help='separate P_t per domain (default), or one shared P_t')
 parser.add_argument('--text_ctx_init_photo', type=str, default='a photo of a')
 parser.add_argument('--text_ctx_init_sketch', type=str, default='a sketch of a')
 parser.add_argument('--n_text_templates', type=int, default=60,
@@ -76,6 +76,9 @@ parser.add_argument('--text_scl_domains', type=str, default='photo,sketch',
 parser.add_argument('--lambda_scl_image', type=float, default=10.0)   # lambda1
 parser.add_argument('--lambda_scl_text', type=float, default=25.0)    # lambda2
 parser.add_argument('--lambda_scl_logits', type=float, default=1.0)
+# CE giữa prompted text feature và prompted visual feature, tính riêng từng
+# domain (photo, sketch) rồi cộng lại. Đây là loss chính của PromptSRC gốc.
+parser.add_argument('--lambda_ce', type=float, default=1.0)
 # Triplet loss của basecode đã bị bỏ khỏi mục tiêu (weight 0). Đặt > 0 để bật
 # lại; khi = 0 nhánh negative cũng không được encode, tiết kiệm 1/5 số forward.
 parser.add_argument('--lambda_retrieval', type=float, default=0.0)
@@ -90,9 +93,12 @@ parser.add_argument('--infonce_mode', type=str, default='instance',
                          'khi batch có nhiều mẫu trùng lớp, hợp với category-level ZS-SBIR.')
 parser.add_argument('--scl_normalize_features', type=int, default=1,
                     help='L2-normalise both sides of the SCL feature L1 losses')
-parser.add_argument('--scl_logits_anchor', type=str, default='sketch',
-                    choices=['sketch', 'photo'],
-                    help='which image branch feeds the SCL-logits pair (design hypothesis, see model)')
+parser.add_argument('--scl_logits_anchor', type=str, default='both',
+                    choices=['sketch', 'photo', 'both'],
+                    help='which image branches feed the SCL-logits pairs. Each branch is '
+                         'matched with the text prompt of its OWN domain (sketch image vs '
+                         'P_t[sketch], photo image vs P_t[photo]) and the two terms are summed, '
+                         'like L_SCL_image. sketch/photo keep a single branch for ablation.')
 
 # GPA -- per branch mu / sigma^2
 parser.add_argument('--gpa_enabled', type=int, default=1)
