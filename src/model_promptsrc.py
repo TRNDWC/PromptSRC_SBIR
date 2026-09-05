@@ -300,12 +300,18 @@ class PromptSRCModel(pl.LightningModule):
         # ---- prompted branches (these build the graph) -----------------------
         photo_p = self.encode_image_prompted(img_tensor, 'photo')
         sketch_p = self.encode_image_prompted(sk_tensor, 'sketch')
-        # negatives are photos -> P_v_photo, but they are NOT regularised by SCL
-        neg_p = self.encode_image_prompted(neg_tensor, 'photo')
         text_p = {d: self.encode_text_prompted(class_list, d) for d in domains}
 
         losses = {}
-        losses['L_retrieval'] = self.loss_fn(sketch_p, photo_p, neg_p)
+        # The basecode triplet is off by default (--lambda_retrieval=0); the
+        # negative is then never encoded, saving one of the five image forwards.
+        # InfoNCE is the objective that drives retrieval in that configuration.
+        if o.lambda_retrieval > 0:
+            neg_p = self.encode_image_prompted(neg_tensor, 'photo')
+            losses['L_retrieval'] = self.loss_fn(sketch_p, photo_p, neg_p)
+        else:
+            neg_p = None
+            losses['L_retrieval'] = torch.zeros((), device=photo_p.device)
         losses['L_infonce'] = self._infonce(sketch_p, photo_p, cls_index)
         losses['L_SCL_image_photo'] = self._scl_feature_loss(photo_p, photo_a)
         losses['L_SCL_image_sketch'] = self._scl_feature_loss(sketch_p, sketch_a)

@@ -65,23 +65,20 @@ parser.add_argument('--text_prompt_mode', type=str, default='shared',
                     help='one shared P_t, or separate P_t per domain')
 parser.add_argument('--text_ctx_init_photo', type=str, default='a photo of a')
 parser.add_argument('--text_ctx_init_sketch', type=str, default='a sketch of a')
-parser.add_argument('--n_text_templates', type=int, default=3,
-                    help='N handcrafted templates averaged into the frozen text anchor. '
-                         'PLACEHOLDER: the paper uses N=60 and its Fig. 5 ablation shows '
-                         'larger N helps; N=3 is only meant to get a run going.')
+parser.add_argument('--n_text_templates', type=int, default=60,
+                    help='N handcrafted templates averaged into the frozen text anchor, '
+                         'matching the N=60 of the paper. Each domain pool holds 60.')
 parser.add_argument('--text_scl_domains', type=str, default='photo,sketch',
                     help='domains averaged in L_SCL_text')
 
-# loss weights.
-# Đã đổi sang 1.0 cho MỌI thành phần theo yêu cầu (các thành phần cân bằng nhau).
-# Giá trị cũ lambda1=10 / lambda2=25 là của PromptSRC gốc, dùng cho loss chính là
-# CE classification (thang đo vài đơn vị); ở đây loss chính là triplet cosine
-# (thang đo ~0.2) nên tỉ lệ đó làm SCL át hẳn retrieval. Cả hai bộ đều CHƯA tune
-# cho SBIR -- đây vẫn là baseline để chạy, không phải giá trị để kết luận.
-parser.add_argument('--lambda_scl_image', type=float, default=1.0)   # lambda1
-parser.add_argument('--lambda_scl_text', type=float, default=1.0)    # lambda2
+# loss weights. lambda1=10 / lambda2=25 là giá trị của PromptSRC gốc,
+# CHƯA tune cho SBIR.
+parser.add_argument('--lambda_scl_image', type=float, default=10.0)   # lambda1
+parser.add_argument('--lambda_scl_text', type=float, default=25.0)    # lambda2
 parser.add_argument('--lambda_scl_logits', type=float, default=1.0)
-parser.add_argument('--lambda_retrieval', type=float, default=1.0)
+# Triplet loss của basecode đã bị bỏ khỏi mục tiêu (weight 0). Đặt > 0 để bật
+# lại; khi = 0 nhánh negative cũng không được encode, tiết kiệm 1/5 số forward.
+parser.add_argument('--lambda_retrieval', type=float, default=0.0)
 
 # InfoNCE giữa prompted sketch feature và prompted photo feature
 parser.add_argument('--lambda_infonce', type=float, default=1.0)

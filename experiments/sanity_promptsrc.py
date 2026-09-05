@@ -90,6 +90,9 @@ def main():
 
     print('  feature shapes:')
     for key in ['photo_prompted', 'photo_anchor', 'sketch_prompted', 'sketch_anchor', 'neg_prompted']:
+        if feats[key] is None:
+            print('    %-18s not encoded (--lambda_retrieval=0)' % key)
+            continue
         print('    %-18s %s  requires_grad=%s' % (key, tuple(feats[key].shape), feats[key].requires_grad))
     for domain, t in feats['text_prompted'].items():
         print('    %-18s %s  requires_grad=%s' % ('text_prompted[%s]' % domain, tuple(t.shape), t.requires_grad))
@@ -132,11 +135,38 @@ def main():
     check('L_final matches the formula', torch.allclose(expected, losses['loss']),
           '(%.6f vs %.6f)' % (expected.item(), losses['loss'].item()))
 
-    lambdas = [opts.lambda_retrieval, opts.lambda_infonce, opts.lambda_scl_image,
-               opts.lambda_scl_text, opts.lambda_scl_logits]
-    check('all loss weights are equal', len(set(lambdas)) == 1, str(lambdas))
+    print('    weights: retrieval=%.1f infonce=%.1f scl_image=%.1f scl_text=%.1f scl_logits=%.1f'
+          % (opts.lambda_retrieval, opts.lambda_infonce, opts.lambda_scl_image,
+             opts.lambda_scl_text, opts.lambda_scl_logits))
+    if opts.lambda_retrieval == 0:
+        check('triplet is out of the objective', losses['L_retrieval'].item() == 0.0)
+        check('negative is not encoded when the triplet is off',
+              feats['neg_prompted'] is None)
+
+    # contribution of each term to the total, at the configured weights
+    contrib = {
+        'retrieval': opts.lambda_retrieval * losses['L_retrieval'].item(),
+        'infonce': opts.lambda_infonce * losses['L_infonce'].item(),
+        'scl_image': opts.lambda_scl_image * (losses['L_SCL_image_photo'].item()
+                                              + losses['L_SCL_image_sketch'].item()),
+        'scl_text': opts.lambda_scl_text * losses['L_SCL_text'].item(),
+        'scl_logits': opts.lambda_scl_logits * losses['L_SCL_logits'].item(),
+    }
+    total = sum(contrib.values())
+    print('    đóng góp vào tổng: %s'
+          % ', '.join('%s %.1f%%' % (k, 100 * v / total) for k, v in contrib.items()))
 
     # InfoNCE sanity: identical sketch/photo features must give the floor value
+    from src.promptsrc_modules import TEMPLATE_POOLS
+    print('    template pools: photo=%d, sketch=%d (dùng N=%d)'
+          % (len(TEMPLATE_POOLS['photo']), len(TEMPLATE_POOLS['sketch']), opts.n_text_templates))
+    for d in ['photo', 'sketch']:
+        pool = TEMPLATE_POOLS[d]
+        check('pool %s có đủ N=%d template' % (d, opts.n_text_templates),
+              len(pool) >= opts.n_text_templates, '(%d)' % len(pool))
+        check('pool %s không trùng lặp' % d, len(set(pool)) == len(pool))
+        check('pool %s: mọi template có {}' % d, all('{}' in t for t in pool))
+
     print('\n== 3b. InfoNCE ==')
     with torch.no_grad():
         f = torch.randn(4, 512)
