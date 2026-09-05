@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.ipynb_checkpoints/
+
+# environments
+venv/
+.venv/
+env/
+
+# training artefacts
+saved_models/
+tb_logs/
+lightning_logs/
+output/
+*.ckpt
+
+# t-SNE plots written by src/utils.py
+frozen_clip_photo.png
+frozen_clip_sketch.png
+
+# editor / OS
+# (.vscode/settings.json is already tracked, so it is deliberately not listed)
+.DS_Store
+.dist/
