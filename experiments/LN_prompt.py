@@ -7,7 +7,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 from src.model_LN_prompt import Model
-from src.dataset_retrieval import Sketchy, ValidDataset
+from src.dataset_retrieval import Sketchy, ValidDataset, visualize_classes
 from experiments.options import opts
 
 if __name__ == '__main__':
@@ -19,8 +19,10 @@ if __name__ == '__main__':
     train_loader = DataLoader(dataset=train_dataset, batch_size=opts.batch_size, num_workers=opts.workers)
     val_loader = DataLoader(dataset=val_dataset, batch_size=opts.batch_size, num_workers=opts.workers)
     
-    val_sketch = ValidDataset(opts, mode='sketch')
-    val_photo = ValidDataset(opts)
+    # this entry point plots t-SNE and labels points by index into
+    # visualize_classes, so it keeps its own 6-class subset
+    val_sketch = ValidDataset(opts, mode='sketch', categories=visualize_classes)
+    val_photo = ValidDataset(opts, categories=visualize_classes)
     val_sketch_loader = DataLoader(dataset=val_sketch, batch_size=opts.test_batch_size, num_workers=opts.workers, shuffle=False)
     val_photo_loader = DataLoader(dataset=val_photo, batch_size=opts.test_batch_size, num_workers=opts.workers, shuffle=False)
 

@@ -10,6 +10,10 @@ parser.add_argument('--exp_name', type=str, default='LN_prompt')
 
 # Path to 'Sketchy' folder holding Sketch_extended dataset. It should have 2 folders named 'sketch' and 'photo'.
 parser.add_argument('--data_dir', type=str, default='/isize2/sain/data/Sketchy/') 
+parser.add_argument('--dataset', type=str, default='sketchy_ext',
+                    choices=['sketchy', 'sketchy_ext', 'sketchy_1', 'sketchy_2',
+                             'tuberlin', 'quickdraw'],
+                    help='selects the unseen-class split and the metric protocol')
 parser.add_argument('--max_size', type=int, default=224)
 parser.add_argument('--nclass', type=int, default=10)
 parser.add_argument('--data_split', type=float, default=-1.0)
@@ -37,6 +41,19 @@ parser.add_argument('--n_prompts', type=int, default=3)
 # ------------------------------------------------------------------
 parser.add_argument('--max_epochs', type=int, default=20,
                     help='GPA weights are defined over this horizon (Eq. 6-7)')
+# ----------------------
+# Evaluation protocol
+# ----------------------
+# Defaults per dataset (src/dataset_retrieval.py DATASET_METRICS):
+#   Sketchy   mAP@200, P@200 | TU-Berlin mAP@all, P@100 | QuickDraw mAP@all, P@200
+# -1 = follow the dataset protocol, 0 = @all, >0 = explicit cutoff.
+parser.add_argument('--map_k', type=int, default=-1)
+parser.add_argument('--p_k', type=int, default=-1)
+parser.add_argument('--gzs', type=int, default=0,
+                    help='generalized ZS-SBIR: mix seen-class photos into the gallery')
+parser.add_argument('--gzs_perc', type=float, default=0.2,
+                    help='fraction of seen-class photos added as gallery distractors')
+
 parser.add_argument('--progress_refresh', type=int, default=20,
                     help='progress bar refresh rate in batches; 0 disables the bar. '
                          'Low values spam one line per step when stdout is not a TTY.')

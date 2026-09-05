@@ -24,6 +24,7 @@ from torchmetrics.functional import retrieval_average_precision, retrieval_preci
 
 from src.clip import clip
 from src.clip.model import convert_weights
+from src.dataset_retrieval import get_metric_config
 from src.promptsrc_modules import (
     TEMPLATE_POOLS,
     GaussianPromptAggregator,
@@ -391,22 +392,29 @@ class PromptSRCModel(pl.LightningModule):
         sk_cat = np.concatenate([l.cpu().numpy() for _, l in self.val_step_outputs_sk])
         ph_cat = np.concatenate([l.cpu().numpy() for _, l in self.val_step_outputs_ph])
 
-        map_k = p_k = 200
+        # per-dataset protocol, overridable with --map_k / --p_k (0 = @all)
+        map_k, p_k = get_metric_config(self.opts)
         ap = torch.zeros(len(query))
         precision = torch.zeros(len(query))
         for idx, sk_feat in enumerate(query):
             sim = F.cosine_similarity(sk_feat.unsqueeze(0), gallery).cpu()
             target = torch.zeros(len(gallery), dtype=torch.bool)
+            # GZS distractors carry label -1, so they never match a query
             target[np.where(ph_cat == sk_cat[idx])] = True
-            ap[idx] = retrieval_average_precision(sim, target, top_k=min(map_k, len(gallery)))
-            precision[idx] = retrieval_precision(sim, target, top_k=min(p_k, len(gallery)))
+            ap[idx] = retrieval_average_precision(
+                sim, target, top_k=min(map_k, len(gallery)) if map_k > 0 else None)
+            precision[idx] = retrieval_precision(
+                sim, target, top_k=min(p_k, len(gallery)) if p_k > 0 else None)
 
         mAP = torch.mean(ap)
         self.log('mAP', mAP, on_step=False, on_epoch=True)
         self.log('prec', torch.mean(precision), on_step=False, on_epoch=True)
         self.best_metric = max(self.best_metric, mAP.item())
-        print('mAP@%d: %.4f, P@%d: %.4f, best mAP: %.4f'
-              % (map_k, mAP.item(), p_k, torch.mean(precision).item(), self.best_metric))
+        print('[%s] mAP@%s: %.4f, P@%s: %.4f, best mAP: %.4f  (|query|=%d, |gallery|=%d)'
+              % (self.opts.dataset,
+                 map_k if map_k > 0 else 'all', mAP.item(),
+                 p_k if p_k > 0 else 'all', torch.mean(precision).item(),
+                 self.best_metric, len(query), len(gallery)))
 
         self.val_step_outputs_sk.clear()
         self.val_step_outputs_ph.clear()
