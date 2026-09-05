@@ -37,6 +37,9 @@ parser.add_argument('--n_prompts', type=int, default=3)
 # ------------------------------------------------------------------
 parser.add_argument('--max_epochs', type=int, default=20,
                     help='GPA weights are defined over this horizon (Eq. 6-7)')
+parser.add_argument('--progress_refresh', type=int, default=20,
+                    help='progress bar refresh rate in batches; 0 disables the bar. '
+                         'Low values spam one line per step when stdout is not a TTY.')
 parser.add_argument('--train_layernorm', type=int, default=1,
                     help='unfreeze every LayerNorm of both CLIP encoders (lr = --clip_LN_lr)')
 parser.add_argument('--anchor_uses_original_ln', type=int, default=1,

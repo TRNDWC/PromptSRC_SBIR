@@ -316,8 +316,19 @@ class PromptSRCModel(pl.LightningModule):
         sk_tensor, img_tensor, neg_tensor, category = batch[:4]
         losses, _ = self.compute_losses(sk_tensor, img_tensor, neg_tensor, category)
         for name, value in losses.items():
-            self.log('train/%s' % name, value, prog_bar=(name == 'loss'))
+            self.log('train/%s' % name, value)
         self.log('train_loss', losses['loss'])
+
+        # Compact live breakdown: the total alone cannot tell "retrieval is
+        # improving" apart from "the SCL terms collapsed", and with lambda1=10 /
+        # lambda2=25 the SCL terms carry most of the total.
+        self.log_dict({
+            'loss': losses['loss'],
+            'ret': losses['L_retrieval'],
+            'scl_i': losses['L_SCL_image_photo'] + losses['L_SCL_image_sketch'],
+            'scl_t': losses['L_SCL_text'],
+            'scl_lg': losses['L_SCL_logits'],
+        }, prog_bar=True, logger=False)
         return losses['loss']
 
     def on_train_epoch_end(self):

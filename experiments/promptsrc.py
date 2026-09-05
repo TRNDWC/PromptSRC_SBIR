@@ -17,7 +17,7 @@ import os
 from torch.utils.data import DataLoader
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 
 from src.model_promptsrc import PromptSRCModel
 from src.dataset_retrieval import Sketchy, ValidDataset
@@ -44,6 +44,15 @@ if __name__ == '__main__':
         mode='max',
         save_last=True)
 
+    # Lightning 2.x picks RichProgressBar automatically when `rich` is
+    # installed, and Rich's live display needs a real TTY -- through a pipe,
+    # tee or nohup it reprints a whole line per refresh instead of overwriting.
+    # tqdm degrades gracefully, and refresh_rate keeps the volume sane either
+    # way. --progress_refresh=0 turns the bar off for good (log files, cron).
+    callbacks = [checkpoint_callback]
+    if opts.progress_refresh > 0:
+        callbacks.append(TQDMProgressBar(refresh_rate=opts.progress_refresh))
+
     ckpt_path = os.path.join('saved_models', opts.exp_name, 'last.ckpt')
     if not os.path.exists(ckpt_path):
         ckpt_path = None
@@ -55,8 +64,8 @@ if __name__ == '__main__':
                       benchmark=True,
                       logger=logger,
                       check_val_every_n_epoch=1,
-                      enable_progress_bar=True,
-                      callbacks=[checkpoint_callback])
+                      enable_progress_bar=opts.progress_refresh > 0,
+                      callbacks=callbacks)
 
     model = PromptSRCModel()
     trainer.fit(model,
