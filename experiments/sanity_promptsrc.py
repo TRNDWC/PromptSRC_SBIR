@@ -49,10 +49,25 @@ def main():
 
     n_prompt = sum(p.numel() for p in model.prompt_parameters())
     n_clip = sum(p.numel() for p in model.clip.parameters())
+    n_ln = sum(p.numel() for p in model._ln_params)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('  CLIP params: %d (frozen) | prompt params: %d | trainable: %d'
-          % (n_clip, n_prompt, n_train))
-    check('only prompts are trainable', n_train == n_prompt, '(%d == %d)' % (n_train, n_prompt))
+    n_ln_mods = sum(1 for m in model.clip.modules() if isinstance(m, torch.nn.LayerNorm))
+    print('  CLIP params: %d | prompt params: %d | LayerNorm params: %d (%d LN modules) | trainable: %d'
+          % (n_clip, n_prompt, n_ln, n_ln_mods, n_train))
+    check('trainable == prompts + LayerNorm', n_train == n_prompt + n_ln,
+          '(%d == %d + %d)' % (n_train, n_prompt, n_ln))
+
+    non_ln = [n for n, p in model.clip.named_parameters()
+              if p.requires_grad and not (n.endswith('ln_1.weight') or n.endswith('ln_1.bias')
+                                          or n.endswith('ln_2.weight') or n.endswith('ln_2.bias')
+                                          or 'ln_pre' in n or 'ln_post' in n or 'ln_final' in n)]
+    check('nothing but LayerNorm is unfrozen in CLIP', not non_ln, str(non_ln[:3]))
+    if int(opts.train_layernorm):
+        check('LayerNorm is unfrozen in BOTH encoders',
+              any(n.startswith('visual.') for n, _ in model._ln_backup)
+              and any(not n.startswith('visual.') for n, _ in model._ln_backup))
+        check('pristine LN copy was saved for the anchors',
+              len(model._ln_backup) == len(model._ln_params))
     check('CLIP is fp32 (clip_float)', model.clip.dtype == torch.float32, str(model.clip.dtype))
 
     # ---------------------------------------------------------------- 0. compat
@@ -134,8 +149,47 @@ def main():
             check('%s: every layer gets gradient' % name, not dead, 'dead layers %s' % dead)
 
     clip_with_grad = [n for n, p in model.clip.named_parameters() if p.grad is not None]
-    check('no gradient reached the frozen CLIP', len(clip_with_grad) == 0,
-          '' if not clip_with_grad else str(clip_with_grad[:3]))
+    frozen_with_grad = [n for n, p in model.clip.named_parameters()
+                        if p.grad is not None and not p.requires_grad]
+    check('no gradient reached the frozen part of CLIP', len(frozen_with_grad) == 0,
+          '' if not frozen_with_grad else str(frozen_with_grad[:3]))
+    if int(opts.train_layernorm):
+        ln_grads = [p.grad.norm().item() for p in model._ln_params if p.grad is not None]
+        print('    LayerNorm: %d/%d params got a grad, mean norm %.3e'
+              % (len(ln_grads), len(model._ln_params),
+                 sum(ln_grads) / max(len(ln_grads), 1)))
+        check('LayerNorm receives gradient',
+              len(ln_grads) == len(model._ln_params) and all(g > 0 for g in ln_grads))
+        check('gradient touches ONLY prompts + LayerNorm',
+              len(clip_with_grad) == len(model._ln_params),
+              '(%d vs %d)' % (len(clip_with_grad), len(model._ln_params)))
+
+    # ------------------------------------------- 4b. anchors must not drift
+    print('\n== 4b. anchor stability under trainable LayerNorm ==')
+    if not int(opts.train_layernorm):
+        print('    train_layernorm=0, nothing to check')
+    else:
+        before_img, _ = None, None
+        with torch.no_grad():
+            _, before_img = model.encode_image_branch(img, 'photo')
+            before_txt = model.encode_text_anchor(['cow', 'tree'], 'photo')
+            # simulate an optimiser step moving every LayerNorm
+            for p in model._ln_params:
+                p.add_(0.05 * torch.randn_like(p))
+            _, after_img = model.encode_image_branch(img, 'photo')
+            model._anchor_text_cache.clear()  # force recompute, not a cache hit
+            after_txt = model.encode_text_anchor(['cow', 'tree'], 'photo')
+            prompted_after, _ = model.encode_image_branch(img, 'photo', return_anchor=False)
+        d_img = (before_img - after_img).abs().max().item()
+        d_txt = (before_txt - after_txt).abs().max().item()
+        print('    after perturbing LN: image anchor drift %.3e, text anchor drift %.3e' % (d_img, d_txt))
+        if int(opts.anchor_uses_original_ln):
+            check('image anchor is unchanged by LN training', d_img < 1e-5)
+            check('text anchor is unchanged by LN training', d_txt < 1e-5)
+        else:
+            check('anchors follow LN as configured', d_img > 1e-5)
+        check('the prompted branch DOES see the new LN',
+              not torch.allclose(prompted_after, feats['photo_prompted'].detach()))
 
     # ----------------------------------------------------------------- 5. GPA
     print('\n== 5. GPA (Eq. 6-7) ==')

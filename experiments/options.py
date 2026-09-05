@@ -37,6 +37,11 @@ parser.add_argument('--n_prompts', type=int, default=3)
 # ------------------------------------------------------------------
 parser.add_argument('--max_epochs', type=int, default=20,
                     help='GPA weights are defined over this horizon (Eq. 6-7)')
+parser.add_argument('--train_layernorm', type=int, default=1,
+                    help='unfreeze every LayerNorm of both CLIP encoders (lr = --clip_LN_lr)')
+parser.add_argument('--anchor_uses_original_ln', type=int, default=1,
+                    help='SCL anchors run with the pre-trained LayerNorm weights, so the '
+                         'regularisation target does not drift with the model')
 parser.add_argument('--clip_float', type=int, default=1,
                     help='cast the frozen CLIP to fp32; fp16 underflows the KL/L1 SCL losses')
 

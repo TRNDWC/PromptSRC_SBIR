@@ -13,6 +13,8 @@ by the retrieval setting:
 The old ``src/model_LN_prompt.py`` is left untouched; this is a parallel model.
 """
 
+from contextlib import contextmanager
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -49,6 +51,28 @@ class PromptSRCModel(pl.LightningModule):
             convert_weights(self.clip)  # back to fp16 if explicitly asked for
         self.clip.apply(freeze_model)
         self.clip.eval()
+
+        # ---- optionally unfreeze every LayerNorm (both encoders) -------------
+        # This is the "LN_prompt" idea the basecode names but never enables
+        # (freeze_all_but_bn in src/model_LN_prompt.py is defined and unused).
+        self._ln_params = []
+        self._ln_backup = []
+        if int(o.train_layernorm):
+            for mod in self.clip.modules():
+                if isinstance(mod, nn.LayerNorm):
+                    for p in mod.parameters():
+                        p.requires_grad_(True)
+                        self._ln_params.append(p)
+            # Pristine copy of the LN weights. The SCL anchors are supposed to be
+            # the ORIGINAL pre-trained CLIP; once LN is trainable the encoder
+            # drifts, so without this the anchor would be a moving target and the
+            # regularisation would collapse towards a no-op. Restored around
+            # every anchor forward -- see original_ln().
+            for name, p in self.clip.named_parameters():
+                if p.requires_grad:
+                    buf = 'ln0__' + name.replace('.', '__')
+                    self.register_buffer(buf, p.detach().clone())
+                    self._ln_backup.append((name, buf))
 
         vision_width = self.clip.visual.conv1.out_channels
         text_width = self.clip.transformer.width
@@ -108,25 +132,65 @@ class PromptSRCModel(pl.LightningModule):
                 + list(self.prompt_sketch.parameters())
                 + list(self.prompt_text.parameters()))
 
+    @contextmanager
+    def original_ln(self):
+        """Restore the pre-trained LayerNorm weights for the duration of the block.
+
+        No-op when LN training is off, or when --anchor_uses_original_ln=0 (in
+        which case the anchors follow the drifting encoder on purpose).
+        """
+        if not self._ln_backup or not int(self.opts.anchor_uses_original_ln):
+            yield
+            return
+        params = dict(self.clip.named_parameters())
+        saved = []
+        try:
+            with torch.no_grad():
+                for name, buf in self._ln_backup:
+                    p = params[name]
+                    saved.append((p, p.detach().clone()))
+                    p.copy_(getattr(self, buf))
+            yield
+        finally:
+            with torch.no_grad():
+                for p, old in saved:
+                    p.copy_(old)
+
     def configure_optimizers(self):
-        # CLIP is fully frozen, so only the prompts are optimised.
-        return torch.optim.Adam(self.prompt_parameters(), lr=self.opts.prompt_lr)
+        # Prompts always; LayerNorm too when --train_layernorm=1, at its own lr.
+        groups = [{'params': self.prompt_parameters(), 'lr': self.opts.prompt_lr}]
+        if self._ln_params:
+            groups.append({'params': self._ln_params, 'lr': self.opts.clip_LN_lr})
+        return torch.optim.Adam(groups)
 
     # ------------------------------------------------------------- image side
+    def encode_image_prompted(self, images, domain):
+        learner = self.prompt_photo if domain == 'photo' else self.prompt_sketch
+        return self.clip.encode_image(
+            images, learner.first(images.shape[0]), learner.deep())
+
+    @torch.no_grad()
+    def encode_image_anchor(self, images):
+        """Frozen anchor: no prompt, no gradient.
+
+        MUST be called inside ``self.original_ln()`` when LayerNorm is trainable
+        -- and BEFORE any prompted forward whose graph is still alive, see
+        compute_losses().
+        """
+        return self.clip.encode_image(images).detach()
+
     def encode_image_branch(self, images, domain, return_anchor=True):
         """Returns (prompted_feature, frozen_anchor_feature).
 
-        The anchor is computed with NO prompt and under ``torch.no_grad()``, so
-        no gradient can leak into it (see the sanity check).
+        Anchor first, then the prompted pass: original_ln() writes the pristine
+        LayerNorm weights in place, which bumps their autograd version counter
+        and would invalidate an already-built prompted graph.
         """
-        learner = self.prompt_photo if domain == 'photo' else self.prompt_sketch
-        feat = self.clip.encode_image(
-            images, learner.first(images.shape[0]), learner.deep())
         anchor = None
         if return_anchor:
-            with torch.no_grad():
-                anchor = self.clip.encode_image(images).detach()
-        return feat, anchor
+            with self.original_ln():
+                anchor = self.encode_image_anchor(images)
+        return self.encode_image_prompted(images, domain), anchor
 
     # -------------------------------------------------------------- text side
     def encode_text_prompted(self, classnames, domain):
@@ -143,16 +207,26 @@ class PromptSRCModel(pl.LightningModule):
         """
         templates = TEMPLATE_POOLS[domain][:int(self.opts.n_text_templates)]
         assert templates, 'n_text_templates must be >= 1'
+        # Caching is only sound while the text encoder is fixed. With trainable
+        # LayerNorm and --anchor_uses_original_ln=0 the anchor changes every
+        # step, so the cache is bypassed rather than silently serving stale
+        # features.
+        use_cache = not self._ln_params or int(self.opts.anchor_uses_original_ln)
         out = []
-        for name in classnames:
-            key = (domain, name, len(templates))
-            if key not in self._anchor_text_cache:
+        with self.original_ln():
+            for name in classnames:
+                key = (domain, name, len(templates))
+                if use_cache and key in self._anchor_text_cache:
+                    out.append(self._anchor_text_cache[key])
+                    continue
                 texts = [t.format(name.replace('_', ' ')) for t in templates]
                 tok = clip.tokenize(texts).to(self.device)
                 feats = self.clip.encode_text(tok)
                 feats = F.normalize(feats.float(), dim=-1).mean(dim=0)
-                self._anchor_text_cache[key] = F.normalize(feats, dim=-1).detach().cpu()
-            out.append(self._anchor_text_cache[key])
+                feats = F.normalize(feats, dim=-1).detach().cpu()
+                if use_cache:
+                    self._anchor_text_cache[key] = feats
+                out.append(feats)
         return torch.stack(out).to(self.device).detach()
 
     # ------------------------------------------------------------------ losses
@@ -179,19 +253,27 @@ class PromptSRCModel(pl.LightningModule):
         o = self.opts
         categories = list(categories)
 
-        photo_p, photo_a = self.encode_image_branch(img_tensor, 'photo')
-        sketch_p, sketch_a = self.encode_image_branch(sk_tensor, 'sketch')
-        # negatives are photos -> P_v_photo, but they are NOT regularised by SCL
-        neg_p, _ = self.encode_image_branch(neg_tensor, 'photo', return_anchor=False)
-
         # class vocabulary of this batch, used for the SCL-logits term
         class_list = sorted(set(categories))
         cls_index = torch.tensor([class_list.index(c) for c in categories], device=self.device)
+        domains = sorted(set(self.text_scl_domains + [o.scl_logits_anchor]))
 
-        text_p, text_a = {}, {}
-        for domain in sorted(set(self.text_scl_domains + [o.scl_logits_anchor])):
-            text_p[domain] = self.encode_text_prompted(class_list, domain)
-            text_a[domain] = self.encode_text_anchor(class_list, domain)
+        # ---- every frozen anchor FIRST, in one original-LayerNorm block ------
+        # Ordering matters: original_ln() restores the pristine LN weights in
+        # place, so it has to run before any prompted graph exists, otherwise
+        # autograd rejects the backward ("variable needed for gradient
+        # computation has been modified by an inplace operation").
+        with self.original_ln():
+            photo_a = self.encode_image_anchor(img_tensor)
+            sketch_a = self.encode_image_anchor(sk_tensor)
+            text_a = {d: self.encode_text_anchor(class_list, d) for d in domains}
+
+        # ---- prompted branches (these build the graph) -----------------------
+        photo_p = self.encode_image_prompted(img_tensor, 'photo')
+        sketch_p = self.encode_image_prompted(sk_tensor, 'sketch')
+        # negatives are photos -> P_v_photo, but they are NOT regularised by SCL
+        neg_p = self.encode_image_prompted(neg_tensor, 'photo')
+        text_p = {d: self.encode_text_prompted(class_list, d) for d in domains}
 
         losses = {}
         losses['L_retrieval'] = self.loss_fn(sketch_p, photo_p, neg_p)
