@@ -351,8 +351,9 @@ class PromptSRCModel(pl.LightningModule):
         self.log('train_loss', losses['loss'])
 
         # Compact live breakdown: the total alone cannot tell "retrieval is
-        # improving" apart from "the SCL terms collapsed", and with lambda1=10 /
-        # lambda2=25 the SCL terms carry most of the total.
+        # improving" apart from "the SCL terms collapsed", and the terms sit on
+        # very different scales even at equal weights (InfoNCE starts near
+        # ln(batch_size), the triplet near its 0.2 margin, SCL near 0.01).
         self.log_dict({
             'loss': losses['loss'],
             'ret': losses['L_retrieval'],
